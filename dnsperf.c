@@ -1,992 +1,1141 @@
 /*
- * A DNS Performance tool.
+ * Copyright (C) 2000-2001,2004-2016 Nominum, Inc.
  *
- * Copyright (C) 2014 Cobblau
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * dnsperf is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ *         http://www.apache.org/licenses/LICENSE-2.0
  *
- * dnsperf is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
+/***
+ ***    DNS Performance Testing Tool
+ ***/
+
+#include <errno.h>
+#include <math.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
 #include <sys/time.h>
-#include <signal.h>
-#include <errno.h>
 
-#include <netinet/in.h>
-#include <arpa/nameser.h>
-#include <arpa/nameser_compat.h>
-#include <resolv.h>
+#define ISC_BUFFER_USEINLINE
 
-#include <events.h>
-#include <sock.h>
+#include <isc/buffer.h>
+#include <isc/file.h>
+#include <isc/list.h>
+#include <isc/mem.h>
+#include <isc/netaddr.h>
+#include <isc/print.h>
+#include <isc/region.h>
+#include <isc/result.h>
+#include <isc/sockaddr.h>
+#include <isc/types.h>
 
+#include <dns/rcode.h>
+#include <dns/result.h>
 
-/*
- * Defines.
- */
-typedef struct timeval timeval_t;
+#include "net.h"
+#include "datafile.h"
+#include "dns.h"
+#include "log.h"
+#include "opt.h"
+#include "os.h"
+#include "util.h"
+#include "version.h"
 
-#define TRUE  1
-#define FALSE 0
+#define DEFAULT_SERVER_NAME             "127.0.0.1"
+#define DEFAULT_SERVER_PORT             53
+#define DEFAULT_LOCAL_PORT              0
+#define DEFAULT_MAX_OUTSTANDING         100
+#define DEFAULT_TIMEOUT                 5
 
-#define UDP   1
-#define TCP   2
+#define TIMEOUT_CHECK_TIME              100000
 
-#define DEFAULT_SERVER    "127.0.0.1"
-#define DEFAULT_PORT      "53"
-#define DEFAULT_TIMEOUT   "3000"      /* ms */
-#define DEFAULT_QUERY_NUM "1000"
-#define DEFAULT_C_QUERY_NUM "100"
+#define MAX_INPUT_DATA                  (64 * 1024)
 
-#define MAX_DOMAIN_LEN     255
+#define MAX_SOCKETS                     256
 
+#define RECV_BATCH_SIZE                 16
 
-/* query states */
-#define F_UNUSED        0  /* unused */
-#define F_CONNECTING    1  /* connect() in progress */
-#define F_SENDING       2  /* writing */
-#define F_READING       4  /* reading */
-#define F_DONE          8  /* all done */
+typedef struct {
+    int argc;
+    char **argv;
+    int family;
+    isc_uint32_t clients;
+    isc_uint32_t threads;
+    isc_uint32_t maxruns;
+    isc_uint64_t timelimit;
+    isc_sockaddr_t server_addr;
+    isc_sockaddr_t local_addr;
+    isc_uint64_t timeout;
+    isc_uint32_t bufsize;
+    isc_boolean_t edns;
+    isc_boolean_t dnssec;
+    perf_dnstsigkey_t *tsigkey;
+    perf_dnsednsoption_t *edns_option;
+    isc_uint32_t max_outstanding;
+    isc_uint32_t max_qps;
+    isc_uint64_t stats_interval;
+    isc_boolean_t updates;
+    isc_boolean_t verbose;
+} config_t;
 
-typedef struct data_s {
-    unsigned int  qtype;
-    unsigned int  len;         /* domain's len */
-    char          domain[MAX_DOMAIN_LEN];
-} data_t;
+typedef struct {
+    isc_uint64_t start_time;
+    isc_uint64_t end_time;
+    isc_uint64_t stop_time;
+    struct timespec stop_time_ns;
+} times_t;
 
-typedef struct query_s {
-    dns_perf_event_ops_t ops;
+typedef struct {
+    isc_uint64_t rcodecounts[16];
 
-    int           id;
-    int           fd;          /* socket fd */
+    isc_uint64_t num_sent;
+    isc_uint64_t num_interrupted;
+    isc_uint64_t num_timedout;
+    isc_uint64_t num_completed;
 
-    u_char        send_buf[PACKETSZ];
-    int           send_len;
-    int           send_pos;
+    isc_uint64_t total_request_size;
+    isc_uint64_t total_response_size;
 
-    /* DNS respond maybe bigger than PACKETSZ, but we only read PACKETSZ bytes */
-    u_char        recv_buf[PACKETSZ];
-    int           recv_pos;
+    isc_uint64_t latency_sum;
+    isc_uint64_t latency_sum_squares;
+    isc_uint64_t latency_min;
+    isc_uint64_t latency_max;
+} stats_t;
 
-    unsigned int  state;
-    timeval_t     sands;
+typedef ISC_LIST(struct query_info) query_list;
 
-    data_t       *data;
-} query_t;
+typedef struct query_info {
+    isc_uint64_t timestamp;
+    query_list *list;
+    char *desc;
+    int sock;
+    /*
+     * This link links the query into the list of outstanding
+     * queries or the list of available query IDs.
+     */
+    ISC_LINK(struct query_info) link;
+} query_info;
 
+#define NQIDS 65536
 
+typedef struct {
+    query_info queries[NQIDS];
+    query_list outstanding_queries;
+    query_list unused_queries;
 
-/*
- * Global vars.
- */
-char         *g_name_server;
-unsigned int  g_name_server_port;
-char         *g_data_file_name;
-char         *g_real_client;
-unsigned int  g_timeout;
-unsigned int  g_perf_time;
-unsigned int  g_query_number;
-unsigned int  g_concurrent_query;
-unsigned int  g_interval;
-int           g_layer4_protocol = UDP;
-int           g_net_family = AF_INET;
-int           g_print_rcode_num;
-int           g_report_rcode;
+    pthread_t sender;
+    pthread_t receiver;
 
-timeval_t     g_query_start;
-timeval_t     g_query_end;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
 
-/* Stores <domain, qtype> read from data `g_data_file_handler' */
-data_t       *g_data_array;
-int           g_data_array_len;
-query_t      *g_query_array;   /* len = g_concurrent_query */
+    unsigned int nsocks;
+    int current_sock;
+    int *socks;
 
-/* epoll vars */
-int                  g_epoll_fd;
-struct epoll_event  *g_epoll_events;
+    perf_dnsctx_t *dnsctx;
 
+    isc_boolean_t done_sending;
+    isc_uint64_t done_send_time;
 
-/* statistics */
-unsigned int  g_send_number;
-unsigned int  g_recv_number;
-unsigned int  g_success_number;  /* 0 */
-unsigned int  g_formerr_number;  /* 1 */
-unsigned int  g_serverr_number;  /* 2 */
-unsigned int  g_nxdomain_number; /* 3 */
-unsigned int  g_notimp_number;   /* 4 */
-unsigned int  g_refuse_number;   /* 5 */
-unsigned int  g_other_number;    /* other rcode */
+    const config_t *config;
+    const times_t *times;
+    stats_t stats;
 
+    isc_uint32_t max_outstanding;
+    isc_uint32_t max_qps;
 
-int           g_stop;  /* 1: running   0: stop */
+    isc_uint64_t last_recv;
+} threadinfo_t;
 
+static threadinfo_t *threads;
 
-/*
- * Functions.
- */
-void dns_perf_show_info()
+static pthread_mutex_t start_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t start_cond = PTHREAD_COND_INITIALIZER;
+static isc_boolean_t started;
+
+static isc_boolean_t interrupted = ISC_FALSE;
+
+static int threadpipe[2];
+static int mainpipe[2];
+static int intrpipe[2];
+
+static isc_mem_t *mctx;
+
+static perf_datafile_t *input;
+
+static void
+handle_sigint(int sig)
 {
-    printf("\nDNS Performance Testing Tool\n\n");
+    (void)sig;
+    write(intrpipe[1], "", 1);
 }
 
-void dns_perf_show_usage()
+static void
+print_initial_status(const config_t *config)
 {
-    fprintf(stderr,"\n"
-            "Usage: dnsperf [-d datafile] [-s server_addr] [-p port] [-q num_queries]\n"
-            "               [-t timeout] [-Q max queries] [-c concurrent queries]\n"
-            "               [-l running time] [-e real client ip] [-P udp|tcp]\n"
-            "               [-f family] [-T qps] [-c] [-v] [-h]\n\n"
-            "  -d specifies the input data file (default: stdin)\n"
-            "  -s sets the dns server's address (default: %s)\n"
-            "  -p sets the dns server's port (default: %s)\n"
-            "  -t specifies the timeout for query completion in millisecond (default: %s)\n"
-            "  -Q specifies the maximum number of queries to be send (default: %s)\n"
-            "  -c specifies the number of concurrent queries (default: %s)\n"
-            "     dns_perf will randomly pick <domain, type> from data file \n"
-            "  -l specifies how long to run tests in seconds (no default)\n"
-            "  -i Specifies interval of queries in seconds. The default number is zero.\n"
-            "  -e This will sets the real client IP in query string following the rules \n"
-            "       defined in edns-client-subnet\n"
-            "  -P specifies the transport layer protocol to send DNS quires,\n"
-            "     udp or tcp (default: udp)\n"
-            "  -f specify address family of DNS transport, inet or inet6 (default: inet)\n"
-            "  -v verbose: report the RCODE of each response on stdout\n"
-            "  -h print this usage\n"
-            "\n",
-            DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_TIMEOUT, DEFAULT_QUERY_NUM,
-            DEFAULT_C_QUERY_NUM);
-}
-
-/*
- * Set the nameserver's address to be queried.
- */
-int dns_perf_set_str(char **dst, char *src)
-{
-    if ((*dst != NULL) && (src != NULL)) {
-        if (strcmp(src, *dst) == 0) {
-            return 0;
-        }
-    }
-
-    if (src == NULL || src[0] == '\0') {
-        return -1;
-    }
-
-	free(*dst);
-
-	if ((*dst = malloc(strlen(src) + 1)) == NULL) {
-		fprintf(stderr, "Error allocating memory for server name: %s\n", src);
-		return -1;
-	}
-
-    memset(*dst, '\0', strlen(src) + 1);
-    memcpy(*dst, src, strlen(src));
-
-	return 0;
-}
-
-int dns_perf_set_uint(unsigned int *dst, char *src)
-{
-	unsigned int val;
-
-    val = atol(src);
-    if (val <= 0 && val > 65535) {
-        return -1;
-    }
-
-    *dst = val;
-
-	return 0;
-}
-
-void sig_handler(int signo)
-{
-    switch (signo) {
-    case SIGINT:
-    case SIGTERM:
-        g_stop = 1;
-        break;
-
-    default:
-        break;
-    }
-}
-
-timeval_t dns_perf_timer_sub(timeval_t a, timeval_t b)
-{
-    timeval_t ret;
-
-    memset(&ret, 0, sizeof(timeval_t));
-
-    ret.tv_usec = a.tv_usec - b.tv_usec;
-    ret.tv_sec = a.tv_sec - b.tv_sec;
-
-    if (ret.tv_usec < 0) {
-        ret.tv_usec += 1000000;
-        ret.tv_sec--;
-    }
-
-    return ret;
-}
-
-int dns_perf_timer_cmp(timeval_t a, timeval_t b)
-{
-    if (a.tv_sec > b.tv_sec)
-        return 1;
-    if (a.tv_sec < b.tv_sec)
-        return -1;
-    if (a.tv_usec > b.tv_usec)
-        return 1;
-    if (a.tv_usec < b.tv_usec)
-        return -1;
-    return 0;
-}
-
-
-timeval_t dns_perf_timer_add_long(timeval_t a, long b)
-{
-    timeval_t ret;
-
-    memset(&ret, 0, sizeof(timeval_t));
-
-    ret.tv_usec = a.tv_usec + b % 1000000;
-    ret.tv_sec = a.tv_sec + b / 1000000;
-
-    if (ret.tv_usec >= 1000000) {
-        ret.tv_sec++;
-        ret.tv_usec -= 1000000;
-    }
-
-    return ret;
-}
-
-
-int dns_perf_valid_qtype(char *qtype)
-{
-    static char *qtypes[] = {"A", "NS", "MD", "MF", "CNAME", "SOA", "MB", "MG",
-        "MR", "NULL", "WKS", "PTR", "HINFO", "MINFO", "MX", "TXT",
-        "AAAA", "SRV", "NAPTR", "A6", "AXFR", "MAILB", "MAILA", "*", "ANY"};
-
-    static int qtype_codes[] =  {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        15, 16,	28, 33, 35, 38, 252, 253, 254, 255, 255};
-
-    int   qtype_len = sizeof(qtypes) / sizeof(qtypes[0]);
-    int   i;
-
-    for (i = 0; i < qtype_len; i++) {
-        if (strcasecmp(qtypes[i], qtype) == 0) {
-            return qtype_codes[i];
-        }
-    }
-
-    return -1;
-}
-
-
-int dns_perf_parse_args(int argc, char **argv)
-{
-    int queryset, perfset;;
-    int c;
-
-    while((c = getopt(argc, argv, "d:s:p:t:l:Q:q:i:P:f:T:c:e:vh")) != -1) {
-
-        switch (c) {
-        case 'd':
-            if (dns_perf_set_str(&g_data_file_name, optarg) == -1) {
-                fprintf(stderr, "Error setting datafile %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 's':
-            if (dns_perf_set_str(&g_name_server, optarg) == -1) {
-                fprintf(stderr, "Error setting name_server %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'p':
-            if (dns_perf_set_uint(&g_name_server_port, optarg) == -1) {
-                fprintf(stderr, "Error setting name_server's port %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 't':
-            if (dns_perf_set_uint(&g_timeout, optarg) == -1) {
-                fprintf(stderr, "Error setting timeout %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'l':
-            if (dns_perf_set_uint(&g_perf_time, optarg) == -1) {
-                fprintf(stderr, "Error setting query time %s\n", optarg);
-                return -1;
-            }
-            perfset = TRUE;
-            break;
-
-        case 'Q':
-            if (dns_perf_set_uint(&g_query_number, optarg) == -1) {
-                fprintf(stderr, "Error setting query number %s\n", optarg);
-                return -1;
-            }
-            queryset = TRUE;
-            break;
-
-        case 'c':
-            if (dns_perf_set_uint(&g_concurrent_query, optarg) == -1) {
-                fprintf(stderr, "Error setting concurrent query num %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'i':
-            if (dns_perf_set_uint(&g_interval, optarg) == -1) {
-                fprintf(stderr, "Error setting interval number %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'P':
-            if (strcmp(optarg, "udp") == 0) {
-                g_layer4_protocol = UDP;
-            } else if (strcmp(optarg, "tcp") == 0) {
-                g_layer4_protocol = TCP;
-            } else {
-                fprintf(stderr, "Invalid transport protocol: %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'f':
-            if (strcmp(optarg, "inet") == 0) {
-                g_net_family = AF_INET;
-            } else if (strcmp(optarg, "inet6") == 0) {
-                g_net_family = AF_INET6;
-            } else {
-                fprintf(stderr, "Invalid address family: %s\n", optarg);
-                return -1;
-            }
-            break;
-
-        case 'e':
-            if (dns_perf_set_str(&g_real_client, optarg) == -1) {
-                fprintf(stderr, "Error setting edns client ip %s\n", optarg);
-                return -1;
-            }
-            break;
-
-
-        case 'v':
-            g_report_rcode = TRUE;
-            break;
-
-        case 'h':
-            return -1;
-
-        default:
-            fprintf(stderr, "Invalid option: %s\n", optarg);
-            return -1;
-        }
-    }
-
-    if (queryset == TRUE && perfset == TRUE) {
-        fprintf(stderr, "-Q and -l is exclusive, please set only one\n");
-        return -1;
-    }
-
-    if (g_perf_time != 0) {
-        g_query_number = 100000000;
-    }
-
-    return 0;
-}
-
-
-/*
- * dns_perf_data_array_init:
- *     fill 'g_query_array' with information read from 'g_data_file_handler'
- */
-int dns_perf_data_array_init()
-{
-    FILE    *file;
-    char     buf[1024], domain[255], qtype[10];
-    int      len = 0, qtype_n;
-    data_t  *d;
-
-    if (g_data_file_name == NULL) {
-        return -1;
-    }
-
-
-    if ((file = fopen(g_data_file_name, "r")) == NULL) {
-        return -1;
-    }
-
-    /* Calculate how many useful lines */
-    while(fgets(buf, 1024, file) != 0) {
-        if (buf[0] == '#' || buf[0] == '\n') {
-            continue;
-        }
-
-        len++;
-    }
-
-    if ((g_data_array = calloc(len, sizeof(data_t))) == NULL) {
-        fprintf(stderr, "Malloc memory error");
-        goto finish;
-    }
-
-    rewind(file);
-    g_data_array_len = 0;
-    while(fgets(buf, 1024, file) != 0) {
-        if (buf[0] == '#' || buf[0] == '\n') {
-            continue;
-        }
-
-        if (sscanf(buf, "%s %s", domain, qtype) == EOF) {
-            fprintf(stderr, "Error string in data file:%s\n", buf);
-            goto finish;
-        }
-
-        if (strlen(domain) > MAX_DOMAIN_LEN) {
-            fprintf(stderr, "Error domain name too long:%s\n", domain);
-            goto finish;
-        }
-
-        if ((qtype_n = dns_perf_valid_qtype(qtype)) == -1) {
-            fprintf(stderr, "Error unknown qtype:%s\n", qtype);
-            goto finish;
-        }
-
-        d = &g_data_array[g_data_array_len];
-        d->len = strlen(domain);
-        memcpy(d->domain, domain, d->len);
-        d->qtype = qtype_n;
-
-        g_data_array_len++;
-    }
-
- finish:
-
-    if (fclose(file) != 0) {
-        free(g_data_array);
-        return -1;
-    }
-
-    return 0;
-}
-
-/*
- * Do I need write description to this file? I don't think so.
- */
-int dns_perf_generate_query(query_t *q)
-{
-    static unsigned short query_id = 0;
-    int                   len;
-    unsigned short        net_id;
-    u_char                 *p, *t;
-    HEADER               *hp;
-    in_addr_t             addr;
-
-
-    len = res_mkquery(QUERY, q->data->domain, C_IN, q->data->qtype, NULL,
-                      0, NULL, q->send_buf, sizeof(q->send_buf));
-    if (len == -1) {
-        fprintf(stderr, "Failed to create query packet: %s %d\n", q->data->domain,
-                q->data->qtype);
-        return -1;
-    }
-
-    hp = (HEADER *) q->send_buf;
-    hp->rd = 1;    /* recursion */
-
-    query_id++;
-    q->id = query_id;
-
-    /* set message id */
-    net_id = htons(query_id);
-    p = (u_char *) &net_id;
-    q->send_buf[0] = p[0];
-    q->send_buf[1] = p[1];
-
-    if (g_real_client) {
-        q->send_buf[11] = 1;   /* set additional count to  1 */
-
-        p = q->send_buf + len; /* p points to additional section */
-
-        *p++ = 0;      /* root name */
-
-        *p++ = 0;      /* OPT */
-        *p++ = 41;
-
-        *p++ = 4;      /* UDP payload size: 1024 */
-        *p++ = 0;
-
-        *p++ = 0;      /* extended RCODE and flags */
-        *p++ = 0;
-        *p++ = 0;
-        *p++ = 0;
-
-        *p++ = 0;      /* edns-client-subnet's length */
-        *p++ = 12;
-
-        /* edns-client-subnet */
-        *p++ = 0;      /* option code: 8 */
-        *p++ = 8;
-
-        *p++ = 0;      /* option length: 8 */
-        *p++ = 8;
-
-        *p++ = 0;      /* family: 1 */
-        *p++ = 1;
-
-        *p++ = 32;     /* source netmask: 32 */
-        *p++ = 0;      /* scope netmask: 0 */
-
-        addr = inet_addr(g_real_client);  /* client subnet */
-        t = (u_char *) &addr;
-
-        *p++ = *t++;
-        *p++ = *t++;
-        *p++ = *t++;
-        *p++ = *t++;
-
-        len += 23;
-    }
-
-    q->send_len = len;
-    q->send_pos = 0;
-
-    return 0;
-}
-
-
-int dns_perf_query_process_response(query_t *q, unsigned short id, unsigned short flag)
-{
-    /* 做一些统计工作 */
-    if (q->id != id) {
-        return -1;  /* TODO: can be happened */
-    }
-
-    g_recv_number++;
-
-    switch(flag) {
-    case 0:
-        g_success_number++;
-        break;
-
-    case 1:
-        g_formerr_number++;
-        break;
-
-    case 2:
-        g_serverr_number++;
-        break;
-
-    case 3:
-        g_nxdomain_number++;
-        break;
-
-    case 4:
-        g_notimp_number++;
-        break;
-
-    case 5:
-        g_refuse_number++;
-        break;
-
-    default:
-        g_other_number++;
-        break;
-    }
-
-    return 0;
-}
-
-
-int dns_perf_query_send(void *arg)
-{
-    int ret;
-    query_t *q = arg;
-
-
-    ret = send(q->fd, q->send_buf + q->send_pos, q->send_len - q->send_pos, 0);
-    if (ret < 0) {
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            goto error;
-        }
-
-        q->state = F_SENDING;
-        if (dns_perf_eventsys_set_fd(q->fd, MOD_WR, q) == -1) {
-            fprintf(stderr, "Error set write fd:%d\n", q->fd);
-            goto error;
-        }
-
-    } else { /* already send */
-        if (ret != q->send_len) {
-            q->state = F_SENDING;
-            q->send_pos += ret;
-            if (dns_perf_eventsys_set_fd(q->fd, MOD_WR, q) == -1) {
-                fprintf(stderr, "Error set write fd:%d\n", q->fd);
-                goto error;
-            }
-        }
-
-        q->state = F_READING;
-        if (dns_perf_eventsys_set_fd(q->fd, MOD_RD, q) == -1) {
-            fprintf(stderr, "Error set read fd:%d\n", q->fd);
-            goto error;
-        }
-    }
-
-    return 0;
-
- error:
-    close(q->fd);
-    q->state = F_UNUSED;
-
-    return 0;
-}
-
-int dns_perf_query_recv(void *arg)
-{
-    static u_char input[1024];
-    int           ret;
-    unsigned short  id;
-    unsigned short  flags;
-    query_t        *q = arg;
-
-
-    ret = recv(q->fd, q->recv_buf + q->recv_pos, sizeof(q->recv_buf) - q->recv_pos, 0);
-
-    if (ret < 0) {
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            close(q->fd);
-            q->state = F_UNUSED;
-            return 0;
-        }
-
-        if (dns_perf_eventsys_set_fd(q->fd, MOD_RD, q) == -1) {
-            close(q->fd);
-            q->state = F_UNUSED;
-            return 0;
-        }
-    } else {
-        close(q->fd);
-        q->state = F_UNUSED;
-
-        id = input[0] * 256 + input[1];
-        flags = input[2] * 256 + input[3];
-
-        dns_perf_query_process_response(q, id, flags & 0xF);
-    }
-
-    return 0;
-}
-
-
-static int dns_perf_cancel_timeout_query()
-{
-    int       i;
-    query_t  *query;
-    timeval_t now, diff;
-
-    /* Deal with timeout */
-    gettimeofday(&now, NULL);
-    for (i = 0; i < g_concurrent_query ; i++) {
-
-        query = &g_query_array[i];
-
-        if (query->state == F_UNUSED) {
-            continue;
-        }
-
-        diff = dns_perf_timer_sub(now, query->sands);
-        if (diff.tv_sec * 1000000 + diff.tv_usec >= 0) {
-            /* delete timeouted queries */
-            if (query->state == F_SENDING) {
-                dns_perf_eventsys_clear_fd(query->fd, MOD_WR);
-            } else if (query->state == F_READING) {
-                dns_perf_eventsys_clear_fd(query->fd, MOD_RD);
-            }
-
-            close(query->fd);
-            query->state = F_UNUSED;
-        }
-    }
-
-    return 0;
-}
-
-
-
-
-/*
- * dns_perf_prepare:
- *     Do some preparation before quering.
- *   1. allocate query_array
- */
-static int dns_perf_prepare()
-{
-    query_t    *q;
-    int         i, index;
-
-    g_query_array = calloc(g_concurrent_query, sizeof(query_t));
-    if (g_query_array == NULL) {
-        fprintf(stderr, "Error memory low");
-        return -1;
-    }
-
-    for (i = 0; i < g_concurrent_query; i++) {
-
-        index = random() % g_data_array_len;
-
-        q = &g_query_array[i];
-
-        q->data = &g_data_array[index];
-        q->ops.send = dns_perf_query_send;
-        q->ops.recv = dns_perf_query_recv;
-        q->id = q->fd = -1;
-        q->send_pos = q->recv_pos = 0;
-        q->state = F_UNUSED;
-    }
-
-    return 0;
-}
-
-
-/*
- * Whip query_t to make it as busy as possible.
- */
-static int dns_perf_whip_query()
-{
-    int       i;
-    query_t  *q;
-    timeval_t tv;
-
-    for (i = 0; i < g_concurrent_query; i++) {
-
-        q = &g_query_array[i];
-
-        if (q->state != F_UNUSED) {
-            continue;
-        }
-
-        q->fd = dns_perf_open_udp_socket(g_name_server, g_name_server_port,
-                                         g_net_family);
-        if (q->fd == -1) {
-            fprintf(stderr, "Error create udp socket failed\n");
-            return -1;
-        }
-
-        q->state = F_CONNECTING;
-
-        if (dns_perf_generate_query(q) != 0) {
-            return -1;
-        }
-
-        gettimeofday(&tv, NULL);
-        q->sands = dns_perf_timer_add_long(tv, g_timeout * 1000);
-
-        /* send query to remote name server */
-        if (dns_perf_query_send(q) == -1) {
-            continue;
-        }
-
-        g_send_number++;
-    }
-
-    return 0;
-}
-
-
-static int dns_perf_clear_query()
-{
+    time_t now;
+    isc_netaddr_t addr;
+    char buf[ISC_NETADDR_FORMATSIZE];
     int i;
-    query_t  *q;
 
-    for (i = 0; i < g_concurrent_query; i++) {
+    printf("[Status] Command line: %s", isc_file_basename(config->argv[0]));
+    for (i = 1; i < config->argc; i++)
+        printf(" %s", config->argv[i]);
+    printf("\n");
 
-        q = &g_query_array[i];
+    isc_netaddr_fromsockaddr(&addr, &config->server_addr);
+    isc_netaddr_format(&addr, buf, sizeof(buf));
+    printf("[Status] Sending %s (to %s)\n",
+           config->updates ? "updates" : "queries", buf);
 
-        if (q->state != F_UNUSED) {
-            close(q->fd);
+    now = time(NULL);
+    printf("[Status] Started at: %s", ctime(&now));
+
+    printf("[Status] Stopping after ");
+    if (config->timelimit)
+        printf("%u.%06u seconds",
+               (unsigned int)(config->timelimit / MILLION),
+               (unsigned int)(config->timelimit % MILLION));
+    if (config->timelimit && config->maxruns)
+        printf(" or ");
+    if (config->maxruns)
+        printf("%u run%s through file", config->maxruns,
+               config->maxruns == 1 ? "" : "s");
+    printf("\n");
+}
+
+static void
+print_final_status(const config_t *config)
+{
+    const char *reason;
+
+    if (interrupted)
+        reason = "interruption";
+    else if (config->maxruns > 0 &&
+             perf_datafile_nruns(input) == config->maxruns)
+        reason = "end of file";
+    else
+        reason = "time limit";
+
+    printf("[Status] Testing complete (%s)\n", reason);
+    printf("\n");
+}
+
+static double
+stddev(isc_uint64_t sum_of_squares, isc_uint64_t sum, isc_uint64_t total)
+{
+    double squared;
+
+    squared = (double)sum * (double)sum;
+    return sqrt((sum_of_squares - (squared / total)) / (total - 1));
+}
+
+static void
+print_statistics(const config_t *config, const times_t *times, stats_t *stats)
+{
+    const char *units;
+    isc_uint64_t run_time;
+    isc_boolean_t first_rcode;
+    isc_uint64_t latency_avg;
+    unsigned int i;
+
+    units = config->updates ? "Updates" : "Queries";
+
+    run_time = times->end_time - times->start_time;
+
+    printf("Statistics:\n\n");
+
+    printf("  %s sent:         %" ISC_PRINT_QUADFORMAT "u\n",
+           units, stats->num_sent);
+    printf("  %s completed:    %" ISC_PRINT_QUADFORMAT "u (%.2lf%%)\n",
+           units, stats->num_completed,
+           SAFE_DIV(100.0 * stats->num_completed, stats->num_sent));
+    printf("  %s lost:         %" ISC_PRINT_QUADFORMAT "u (%.2lf%%)\n",
+           units, stats->num_timedout,
+           SAFE_DIV(100.0 * stats->num_timedout, stats->num_sent));
+    if (stats->num_interrupted > 0)
+        printf("  %s interrupted:  %" ISC_PRINT_QUADFORMAT "u (%.2lf%%)\n",
+               units, stats->num_interrupted,
+               SAFE_DIV(100.0 * stats->num_interrupted, stats->num_sent));
+    printf("\n");
+
+    printf("  Response codes:       ");
+    first_rcode = ISC_TRUE;
+    for (i = 0; i < 16; i++) {
+        if (stats->rcodecounts[i] == 0)
+            continue;
+        if (first_rcode)
+            first_rcode = ISC_FALSE;
+        else
+            printf(", ");
+        printf("%s %" ISC_PRINT_QUADFORMAT "u (%.2lf%%)",
+               perf_dns_rcode_strings[i], stats->rcodecounts[i],
+               (stats->rcodecounts[i] * 100.0) / stats->num_completed);
+    }
+    printf("\n");
+
+    printf("  Average packet size:  request %u, response %u\n",
+           (unsigned int)SAFE_DIV(stats->total_request_size, stats->num_sent),
+           (unsigned int)SAFE_DIV(stats->total_response_size,
+                                  stats->num_completed));
+    printf("  Run time (s):         %u.%06u\n",
+           (unsigned int)(run_time / MILLION),
+           (unsigned int)(run_time % MILLION));
+    printf("  %s per second:   %.6lf\n", units,
+           SAFE_DIV(stats->num_completed, (((double)run_time) / MILLION)));
+
+    printf("\n");
+
+    latency_avg = SAFE_DIV(stats->latency_sum, stats->num_completed);
+    printf("  Average Latency (s):  %u.%06u (min %u.%06u, max %u.%06u)\n",
+           (unsigned int)(latency_avg / MILLION),
+           (unsigned int)(latency_avg % MILLION),
+           (unsigned int)(stats->latency_min / MILLION),
+           (unsigned int)(stats->latency_min % MILLION),
+           (unsigned int)(stats->latency_max / MILLION),
+           (unsigned int)(stats->latency_max % MILLION));
+    if (stats->num_completed > 1) {
+        printf("  Latency StdDev (s):   %f\n",
+               stddev(stats->latency_sum_squares, stats->latency_sum,
+                      stats->num_completed) / MILLION);
+    }
+
+    printf("\n");
+}
+
+static void
+sum_stats(const config_t *config, stats_t *total)
+{
+    unsigned int i, j;
+
+    memset(total, 0, sizeof(*total));
+
+    for (i = 0; i < config->threads; i++) {
+        stats_t *stats = &threads[i].stats;
+
+        for (j = 0; j < 16; j++)
+            total->rcodecounts[j] += stats->rcodecounts[j];
+
+        total->num_sent += stats->num_sent;
+        total->num_interrupted += stats->num_interrupted;
+        total->num_timedout += stats->num_timedout;
+        total->num_completed += stats->num_completed;
+
+        total->total_request_size += stats->total_request_size;
+        total->total_response_size += stats->total_response_size;
+
+        total->latency_sum += stats->latency_sum;
+        total->latency_sum_squares += stats->latency_sum_squares;
+        total->latency_min += stats->latency_min;
+        total->latency_max += stats->latency_max;
+    }
+}
+
+static char *
+stringify(unsigned int value)
+{
+    static char buf[20];
+
+    snprintf(buf, sizeof(buf), "%u", value);
+    return buf;
+}
+
+static void
+setup(int argc, char **argv, config_t *config)
+{
+    const char *family = NULL;
+    const char *server_name = DEFAULT_SERVER_NAME;
+    in_port_t server_port = DEFAULT_SERVER_PORT;
+    const char *local_name = NULL;
+    in_port_t local_port = DEFAULT_LOCAL_PORT;
+    const char *filename = NULL;
+    const char *edns_option = NULL;
+    const char *tsigkey = NULL;
+    isc_result_t result;
+
+    result = isc_mem_create(0, 0, &mctx);
+    if (result != ISC_R_SUCCESS)
+        perf_log_fatal("creating memory context: %s",
+                       isc_result_totext(result));
+
+    dns_result_register();
+
+    memset(config, 0, sizeof(*config));
+    config->argc = argc;
+    config->argv = argv;
+
+    config->family = AF_UNSPEC;
+    config->clients = 1;
+    config->threads = 1;
+    config->timeout = DEFAULT_TIMEOUT * MILLION;
+    config->max_outstanding = DEFAULT_MAX_OUTSTANDING;
+
+    perf_opt_add('f', perf_opt_string, "family",
+                 "address family of DNS transport, inet or inet6", "any",
+                 &family);
+    perf_opt_add('s', perf_opt_string, "server_addr",
+                 "the server to query", DEFAULT_SERVER_NAME, &server_name);
+    perf_opt_add('p', perf_opt_port, "port",
+                 "the port on which to query the server",
+                 stringify(DEFAULT_SERVER_PORT), &server_port);
+    perf_opt_add('a', perf_opt_string, "local_addr",
+                 "the local address from which to send queries", NULL,
+                 &local_name);
+    perf_opt_add('x', perf_opt_port, "local_port",
+                 "the local port from which to send queries",
+                 stringify(DEFAULT_LOCAL_PORT), &local_port);
+    perf_opt_add('d', perf_opt_string, "datafile",
+                 "the input data file", "stdin", &filename);
+    perf_opt_add('c', perf_opt_uint, "clients",
+                 "the number of clients to act as", NULL,
+                 &config->clients);
+    perf_opt_add('T', perf_opt_uint, "threads",
+                 "the number of threads to run", NULL,
+                 &config->threads);
+    perf_opt_add('n', perf_opt_uint, "maxruns",
+                 "run through input at most N times", NULL,
+                 &config->maxruns);
+    perf_opt_add('l', perf_opt_timeval, "timelimit",
+                 "run for at most this many seconds", NULL,
+                 &config->timelimit);
+    perf_opt_add('b', perf_opt_uint, "buffer_size",
+                 "socket send/receive buffer size in kilobytes", NULL,
+                 &config->bufsize);
+    perf_opt_add('t', perf_opt_timeval, "timeout",
+                 "the timeout for query completion in seconds",
+                 stringify(DEFAULT_TIMEOUT), &config->timeout);
+    perf_opt_add('e', perf_opt_boolean, NULL,
+                 "enable EDNS 0", NULL, &config->edns);
+    perf_opt_add('E', perf_opt_string, "code:value",
+                 "send EDNS option", NULL, &edns_option);
+    perf_opt_add('D', perf_opt_boolean, NULL,
+                 "set the DNSSEC OK bit (implies EDNS)", NULL,
+                 &config->dnssec);
+    perf_opt_add('y', perf_opt_string, "[alg:]name:secret",
+                 "the TSIG algorithm, name and secret", NULL,
+                 &tsigkey);
+    perf_opt_add('q', perf_opt_uint, "num_queries",
+                 "the maximum number of queries outstanding",
+                 stringify(DEFAULT_MAX_OUTSTANDING),
+                 &config->max_outstanding);
+    perf_opt_add('Q', perf_opt_uint, "max_qps",
+                 "limit the number of queries per second", NULL,
+                 &config->max_qps);
+    perf_opt_add('S', perf_opt_timeval, "stats_interval",
+                 "print qps statistics every N seconds",
+                 NULL, &config->stats_interval);
+    perf_opt_add('u', perf_opt_boolean, NULL,
+                 "send dynamic updates instead of queries",
+                 NULL, &config->updates);
+    perf_opt_add('v', perf_opt_boolean, NULL,
+                 "verbose: report each query to stdout",
+                 NULL, &config->verbose);
+
+    perf_opt_parse(argc, argv);
+
+    if (family != NULL)
+        config->family = perf_net_parsefamily(family);
+    perf_net_parseserver(config->family, server_name, server_port,
+                         &config->server_addr);
+    perf_net_parselocal(isc_sockaddr_pf(&config->server_addr),
+                        local_name, local_port, &config->local_addr);
+
+    input = perf_datafile_open(mctx, filename);
+
+    if (config->maxruns == 0 && config->timelimit == 0)
+        config->maxruns = 1;
+    perf_datafile_setmaxruns(input, config->maxruns);
+
+    if (config->dnssec || edns_option != NULL)
+        config->edns = ISC_TRUE;
+
+    if (tsigkey != NULL)
+        config->tsigkey = perf_dns_parsetsigkey(tsigkey, mctx);
+
+    if (edns_option != NULL)
+        config->edns_option = perf_dns_parseednsoption(edns_option, mctx);
+
+    /*
+     * If we run more threads than max-qps, some threads will have
+     * ->max_qps set to 0, and be unlimited.
+     */
+    if (config->max_qps > 0 && config->threads > config->max_qps)
+        config->threads = config->max_qps;
+
+    /*
+     * We also can't run more threads than clients.
+     */
+    if (config->threads > config->clients)
+        config->threads = config->clients;
+}
+
+static void
+cleanup(config_t *config)
+{
+    unsigned int i;
+
+    perf_datafile_close(&input);
+    for (i = 0; i < 2; i++) {
+        close(threadpipe[i]);
+        close(mainpipe[i]);
+        close(intrpipe[i]);
+    }
+    if (config->tsigkey != NULL)
+        perf_dns_destroytsigkey(&config->tsigkey);
+    if (config->edns_option != NULL)
+        perf_dns_destroyednsoption(&config->edns_option);
+    isc_mem_destroy(&mctx);
+}
+
+typedef enum {
+    prepend_unused,
+    append_unused,
+    prepend_outstanding,
+} query_move_op;
+
+static inline void
+query_move(threadinfo_t *tinfo, query_info *q, query_move_op op)
+{
+    ISC_LIST_UNLINK(*q->list, q, link);
+    switch (op) {
+    case prepend_unused:
+        q->list = &tinfo->unused_queries;
+        ISC_LIST_PREPEND(tinfo->unused_queries, q, link);
+        break;
+    case append_unused:
+        q->list = &tinfo->unused_queries;
+        ISC_LIST_APPEND(tinfo->unused_queries, q, link);
+        break;
+    case prepend_outstanding:
+        q->list = &tinfo->outstanding_queries;
+        ISC_LIST_PREPEND(tinfo->outstanding_queries, q, link);
+        break;
+    }
+}
+
+static inline isc_uint64_t
+num_outstanding(const stats_t *stats)
+{
+    return stats->num_sent - stats->num_completed - stats->num_timedout;
+}
+
+static void
+wait_for_start(void)
+{
+    LOCK(&start_lock);
+    while (!started)
+        WAIT(&start_cond, &start_lock);
+    UNLOCK(&start_lock);
+}
+
+static void *
+do_send(void *arg)
+{
+    threadinfo_t *tinfo;
+    const config_t *config;
+    const times_t *times;
+    stats_t *stats;
+    unsigned int max_packet_size;
+    isc_buffer_t msg;
+    isc_uint64_t now, run_time, req_time;
+    char input_data[MAX_INPUT_DATA];
+    isc_buffer_t lines;
+    isc_region_t used;
+    query_info *q;
+    int qid;
+    unsigned char packet_buffer[MAX_EDNS_PACKET];
+    unsigned char *base;
+    unsigned int length;
+    int n;
+    isc_result_t result;
+
+    tinfo = (threadinfo_t *) arg;
+    config = tinfo->config;
+    times = tinfo->times;
+    stats = &tinfo->stats;
+    max_packet_size = config->edns ? MAX_EDNS_PACKET : MAX_UDP_PACKET;
+    isc_buffer_init(&msg, packet_buffer, max_packet_size);
+    isc_buffer_init(&lines, input_data, sizeof(input_data));
+
+    wait_for_start();
+    now = get_time();
+    while (!interrupted && now < times->stop_time) {
+        /* Avoid flooding the network too quickly. */
+        if (stats->num_sent < tinfo->max_outstanding &&
+            stats->num_sent % 2 == 1)
+        {
+            if (stats->num_completed == 0)
+                usleep(1000);
+            else
+                sleep(0);
+            now = get_time();
         }
 
-        q->state = F_UNUSED;
-    }
-
-    return 0;
-}
-
-
-static void dns_perf_statistic()
-{
-    timeval_t     diff;
-    unsigned int  msec;
-    double        elapse, qps;
-
-
-    diff = dns_perf_timer_sub(g_query_end, g_query_start);
-    msec = diff.tv_sec * 1000 + diff.tv_usec / 1000;
-
-    printf("\n[Status]DNS Query Performance Testing Finish\n");
-    printf("[Result]Quries sent:\t\t%d\n", g_send_number);
-    printf("[Result]Quries completed:\t%d\n", g_recv_number);
-    printf("[Result]Complete percentage:\t%.2f\n\n", g_recv_number * 100.0 / g_send_number);
-
-    if (g_report_rcode) {
-        printf("[Result]Rcode=Success:\t%d\n\n", g_success_number);
-        printf("[Result]Rcode=FormatError:\t%d\n\n", g_formerr_number);
-        printf("[Result]Rcode=ServerError:\t%d\n\n", g_serverr_number);
-        printf("[Result]Rcode=NXDOMAIN:\t%d\n\n", g_nxdomain_number);
-        printf("[Result]Rcode=NotImp:\t%d\n\n", g_notimp_number);
-        printf("[Result]Rcode=Refuse:\t%d\n\n", g_refuse_number);
-        printf("[Result]Rcode=Others:\t%d\n\n", g_other_number);
-    }
-
-    elapse = msec * 1.0 / 1000;
-    printf("[Result]Elapsed time(s):\t%.5f\n\n", elapse);
-
-
-    qps = g_send_number / elapse;
-    printf("[Result]Queries Per Second:\t%.5f\n", qps);
-}
-
-
-/*
- * dns_perf_setup:
- *     Init data.
- */
-int dns_perf_setup(int argc, char **argv)
-{
-
-    if (dns_perf_set_str(&g_name_server, DEFAULT_SERVER) == -1) {
-        fprintf(stderr, "%s: Unable to set default name_server\n", argv[0]);
-        return -1;
-    }
-
-    if (dns_perf_set_uint(&g_name_server_port, DEFAULT_PORT) == -1) {
-        fprintf(stderr, "%s: Unable to set default name_server's port\n", argv[0]);
-        return -1;
-    }
-
-    if (dns_perf_set_uint(&g_timeout, DEFAULT_TIMEOUT) == -1) {
-        fprintf(stderr, "%s: Unable to set default timeout\n", argv[0]);
-        return -1;
-    }
-
-    if (dns_perf_set_uint(&g_query_number, DEFAULT_QUERY_NUM) == -1) {
-        fprintf(stderr, "%s: Unable to set default query number\n", argv[0]);
-        return -1;
-    }
-
-    if (dns_perf_set_uint(&g_concurrent_query, DEFAULT_C_QUERY_NUM) == -1) {
-        fprintf(stderr, "%s: Unable to set default concurrent query number\n", argv[0]);
-        return -1;
-    }
-
-    if (dns_perf_parse_args(argc, argv) == -1) {
-        dns_perf_show_usage();
-        return -1;
-    }
-
-    if (dns_perf_data_array_init() == -1) {
-        return -1;
-    }
-
-
-    return 0;
-}
-
-
-int main(int argc, char** argv)
-{
-    timeval_t  now, age;
-
-
-    dns_perf_show_info();
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-
-    if (dns_perf_setup(argc, argv) == -1) {
-        return -1;
-    }
-
-    printf("[Status] Processing query data\n");
-    if (dns_perf_prepare() == -1) {
-        return -1;
-    }
-
-    if (dns_perf_set_event_sys() == -1) {
-        return -1;
-    }
-
-    if (dns_perf_eventsys_init() == -1) {
-        return -1;
-    }
-
-    printf("[Status] Sending queries to %s:%d\n", g_name_server, g_name_server_port);
-    gettimeofday(&g_query_start, NULL);
-
-    /* how long can you live */
-    age = dns_perf_timer_add_long(g_query_start, g_perf_time * 1000000);
-
-    if (dns_perf_whip_query() == -1) {
-        return -1;
-    }
-
-    while (g_stop == 0) {
-        dns_perf_eventsys_dispatch(g_timeout);
-
-        dns_perf_cancel_timeout_query();
-
-        /* Is time up? */
-        if (g_perf_time != 0) {
-            gettimeofday(&now, NULL);
-            if (dns_perf_timer_cmp(now, age) > 0) {
-                printf("time up");
-                break;
+        /* Rate limiting */
+        if (tinfo->max_qps > 0) {
+            run_time = now - times->start_time;
+            req_time = (MILLION * stats->num_sent) / tinfo->max_qps;
+            if (req_time > run_time) {
+                usleep(req_time - run_time);
+                now = get_time();
+                continue;
             }
         }
 
-        /* Is query number overflowed? */
-        if (g_send_number >= g_query_number) {
+        LOCK(&tinfo->lock);
+
+        /* Limit in-flight queries */
+        if (num_outstanding(stats) >= tinfo->max_outstanding) {
+            TIMEDWAIT(&tinfo->cond, &tinfo->lock, &times->stop_time_ns, NULL);
+            UNLOCK(&tinfo->lock);
+            now = get_time();
+            continue;
+        }
+
+        q = ISC_LIST_HEAD(tinfo->unused_queries);
+        query_move(tinfo, q, prepend_outstanding);
+        q->timestamp = ISC_UINT64_MAX;
+        q->sock = tinfo->socks[tinfo->current_sock++ % tinfo->nsocks];
+
+        UNLOCK(&tinfo->lock);
+
+        isc_buffer_clear(&lines);
+        result = perf_datafile_next(input, &lines, config->updates);
+        if (result != ISC_R_SUCCESS) {
+            if (result == ISC_R_INVALIDFILE)
+                perf_log_fatal("input file contains no data");
             break;
         }
 
-        dns_perf_whip_query();
+        qid = q - tinfo->queries;
+        isc_buffer_usedregion(&lines, &used);
+        isc_buffer_clear(&msg);
+        result = perf_dns_buildrequest(tinfo->dnsctx,
+                                       (isc_textregion_t *) &used,
+                                       qid, config->edns,
+                                       config->dnssec, config->tsigkey,
+                                       config->edns_option, &msg);
+        if (result != ISC_R_SUCCESS) {
+            LOCK(&tinfo->lock);
+            query_move(tinfo, q, prepend_unused);
+            UNLOCK(&tinfo->lock);
+            now = get_time();
+            continue;
+        }
+
+        base = isc_buffer_base(&msg);
+        length = isc_buffer_usedlength(&msg);
+
+        now = get_time();
+        if (config->verbose) {
+            q->desc = strdup(lines.base);
+            if (q->desc == NULL)
+                perf_log_fatal("out of memory");
+        }
+        q->timestamp = now;
+
+        stats->num_sent++;
+
+        n = sendto(q->sock, base, length, 0, &config->server_addr.type.sa,
+                   config->server_addr.length);
+        if (n < 0 || (unsigned int) n != length) {
+            perf_log_warning("failed to send packet: %s",
+                             strerror(errno));
+            LOCK(&tinfo->lock);
+            query_move(tinfo, q, prepend_unused);
+            UNLOCK(&tinfo->lock);
+            stats->num_sent--;
+            continue;
+        }
+
+        stats->total_request_size += length;
+    }
+    tinfo->done_send_time = get_time();
+    tinfo->done_sending = ISC_TRUE;
+    write(mainpipe[1], "", 1);
+    return NULL;
+}
+
+static void
+process_timeouts(threadinfo_t *tinfo, isc_uint64_t now)
+{
+    struct query_info *q;
+    const config_t *config;
+
+    config = tinfo->config;
+
+    /* Avoid locking unless we need to. */
+    q = ISC_LIST_TAIL(tinfo->outstanding_queries);
+    if (q == NULL || q->timestamp > now ||
+        now - q->timestamp < config->timeout)
+        return;
+
+    LOCK(&tinfo->lock);
+
+    do {
+        query_move(tinfo, q, append_unused);
+
+        tinfo->stats.num_timedout++;
+
+        if (q->desc != NULL) {
+            perf_log_printf("> T %s", q->desc);
+        } else {
+            perf_log_printf("[Timeout] %s timed out: msg id %u",
+                            config->updates ? "Update" : "Query",
+                            (unsigned int)(q - tinfo->queries));
+        }
+        q = ISC_LIST_TAIL(tinfo->outstanding_queries);
+    } while (q != NULL && q->timestamp < now &&
+             now - q->timestamp >= config->timeout);
+
+    UNLOCK(&tinfo->lock);
+}
+
+typedef struct {
+    int sock;
+    isc_uint16_t qid;
+    isc_uint16_t rcode;
+    unsigned int size;
+    isc_uint64_t when;
+    isc_uint64_t sent;
+    isc_boolean_t unexpected;
+    isc_boolean_t short_response;
+    char *desc;
+} received_query_t;
+
+static isc_boolean_t
+recv_one(threadinfo_t *tinfo, int which_sock,
+         unsigned char *packet_buffer, unsigned int packet_size,
+         received_query_t *recvd, int *saved_errnop)
+{
+    isc_uint16_t *packet_header;
+    int s;
+    isc_uint64_t now;
+    int n;
+
+    packet_header = (isc_uint16_t *) packet_buffer;
+
+    s = tinfo->socks[which_sock];
+    n = recv(s, packet_buffer, packet_size, 0);
+    now = get_time();
+    if (n < 0) {
+        *saved_errnop = errno;
+        return ISC_FALSE;
+    }
+    recvd->sock = s;
+    recvd->qid = ntohs(packet_header[0]);
+    recvd->rcode = ntohs(packet_header[1]) & 0xF;
+    recvd->size = n;
+    recvd->when = now;
+    recvd->sent = 0;
+    recvd->unexpected = ISC_FALSE;
+    recvd->short_response = ISC_TF(n < 4);
+    recvd->desc = NULL;
+    return ISC_TRUE;
+}
+
+static inline void
+bit_set(unsigned char *bits, unsigned int bit)
+{
+    unsigned int shift, mask;
+
+    shift = 7 - (bit % 8);
+    mask = 1 << shift;
+
+    bits[bit / 8] |= mask;
+}
+
+static inline isc_boolean_t
+bit_check(unsigned char *bits, unsigned int bit)
+{
+    unsigned int shift;
+
+    shift = 7 - (bit % 8);
+
+    if ((bits[bit / 8] >> shift) & 0x01)
+        return ISC_TRUE;
+    return ISC_FALSE;
+}
+
+static void *
+do_recv(void *arg)
+{
+    threadinfo_t *tinfo;
+    stats_t *stats;
+    unsigned char packet_buffer[MAX_EDNS_PACKET];
+    received_query_t recvd[RECV_BATCH_SIZE];
+    unsigned int nrecvd;
+    int saved_errno;
+    unsigned char socketbits[MAX_SOCKETS / 8];
+    isc_uint64_t now, latency;
+    query_info *q;
+    unsigned int current_socket, last_socket;
+    unsigned int i, j;
+
+    tinfo = (threadinfo_t *) arg;
+    stats = &tinfo->stats;
+
+    wait_for_start();
+    now = get_time();
+    last_socket = 0;
+    while (!interrupted) {
+        process_timeouts(tinfo, now);
+
+        /*
+         * If we're done sending and either all responses have been
+         * received, stop.
+         */
+        if (tinfo->done_sending && num_outstanding(stats) == 0)
+            break;
+
+        /*
+         * Try to receive a few packets, so that we can process them
+         * atomically.
+         */
+        saved_errno = 0;
+        memset(socketbits, 0, sizeof(socketbits));
+        for (i = 0; i < RECV_BATCH_SIZE; i++) {
+            for (j = 0; j < tinfo->nsocks; j++) {
+                current_socket = (j + last_socket) % tinfo->nsocks;
+                if (bit_check(socketbits, current_socket))
+                    continue;
+                if (recv_one(tinfo, current_socket, packet_buffer,
+                             sizeof(packet_buffer), &recvd[i], &saved_errno))
+                {
+                    last_socket = (current_socket + 1);
+                    break;
+                }
+                bit_set(socketbits, current_socket);
+                if (saved_errno != EAGAIN)
+                    break;
+            }
+            if (j == tinfo->nsocks)
+                break;
+        }
+        nrecvd = i;
+
+        /* Do all of the processing that requires the lock */
+        LOCK(&tinfo->lock);
+        for (i = 0; i < nrecvd; i++) {
+            if (recvd[i].short_response)
+                continue;
+
+            q = &tinfo->queries[recvd[i].qid];
+            if (q->list != &tinfo->outstanding_queries ||
+                q->timestamp == ISC_UINT64_MAX ||
+                q->sock != recvd[i].sock)
+            {
+                recvd[i].unexpected = ISC_TRUE;
+                continue;
+            }
+            query_move(tinfo, q, append_unused);
+            recvd[i].sent = q->timestamp;
+            recvd[i].desc = q->desc;
+            q->desc = NULL;
+        }
+        SIGNAL(&tinfo->cond);
+        UNLOCK(&tinfo->lock);
+
+        /* Now do the rest of the processing unlocked */
+        for (i = 0; i < nrecvd; i++) {
+            if (recvd[i].short_response) {
+                perf_log_warning("received short response");
+                continue;
+            }
+            if (recvd[i].unexpected) {
+                perf_log_warning("received a response with an "
+                                 "unexpected (maybe timed out) "
+                                 "id: %u", recvd[i].qid);
+                continue;
+            }
+            latency = recvd[i].when - recvd[i].sent;
+            if (recvd[i].desc != NULL) {
+                perf_log_printf(
+                                "> %s %s %u.%06u",
+                                perf_dns_rcode_strings[recvd[i].rcode],
+                                recvd[i].desc,
+                                (unsigned int)(latency / MILLION),
+                                (unsigned int)(latency % MILLION));
+                free(recvd[i].desc);
+            }
+
+            stats->num_completed++;
+            stats->total_response_size += recvd[i].size;
+            stats->rcodecounts[recvd[i].rcode]++;
+            stats->latency_sum += latency;
+            stats->latency_sum_squares += (latency * latency);
+            if (latency < stats->latency_min ||
+                stats->num_completed == 1)
+                stats->latency_min = latency;
+            if (latency > stats->latency_max)
+                stats->latency_max = latency;
+        }
+
+        if (nrecvd > 0)
+            tinfo->last_recv = recvd[nrecvd - 1].when;
+
+        /*
+         * If there was an error, handle it (by either ignoring it,
+         * blocking, or exiting).
+         */
+        if (nrecvd < RECV_BATCH_SIZE) {
+            if (saved_errno == EINTR) {
+                continue;
+            } else if (saved_errno == EAGAIN) {
+                perf_os_waituntilanyreadable(tinfo->socks, tinfo->nsocks,
+                                             threadpipe[0], TIMEOUT_CHECK_TIME);
+                now = get_time();
+                continue;
+            } else {
+                perf_log_fatal("failed to receive packet: %s",
+                               strerror(saved_errno));
+            }
+        }
     }
 
-    gettimeofday(&g_query_end, NULL);
+    return NULL;
+}
 
-    dns_perf_statistic();
+static void *
+do_interval_stats(void *arg)
+{
+    threadinfo_t *tinfo;
+    stats_t total;
+    isc_uint64_t now;
+    isc_uint64_t last_interval_time;
+    isc_uint64_t last_completed;
+    isc_uint64_t interval_time;
+    isc_uint64_t num_completed;
+    double qps;
 
-    dns_perf_clear_query();
+    tinfo = arg;
+    last_interval_time = tinfo->times->start_time;
+    last_completed = 0;
 
-    free(g_data_array);
-    free(g_query_array);
-    free(g_name_server);
-    free(g_data_file_name);
+    wait_for_start();
+    while (perf_os_waituntilreadable(threadpipe[0], threadpipe[0],
+                                     tinfo->config->stats_interval) ==
+           ISC_R_TIMEDOUT)
+    {
+        now = get_time();
+        sum_stats(tinfo->config, &total);
+        interval_time = now - last_interval_time;
+        num_completed = total.num_completed - last_completed;
+        qps = num_completed / (((double)interval_time) / MILLION);
+        perf_log_printf("%u.%06u: %.6lf",
+                        (unsigned int)(now / MILLION),
+                        (unsigned int)(now % MILLION), qps);
+        last_interval_time = now;
+        last_completed = total.num_completed;
+    }
 
-    dns_perf_eventsys_destroy();
+    return NULL;
+}
 
-    return 0;
+static void
+cancel_queries(threadinfo_t *tinfo)
+{
+    struct query_info *q;
+
+    while (ISC_TRUE) {
+        q = ISC_LIST_TAIL(tinfo->outstanding_queries);
+        if (q == NULL)
+            break;
+        query_move(tinfo, q, append_unused);
+
+        if (q->timestamp == ISC_UINT64_MAX)
+            continue;
+
+        tinfo->stats.num_interrupted++;
+        if (q->desc != NULL) {
+            perf_log_printf("> I %s", q->desc);
+            free(q->desc);
+            q->desc = NULL;
+        }
+    }
+}
+
+static isc_uint32_t
+per_thread(isc_uint32_t total, isc_uint32_t nthreads, unsigned int offset)
+{
+    isc_uint32_t value;
+
+    value = total / nthreads;
+    if (value % nthreads > offset)
+        value++;
+    return value;
+}
+
+static void
+threadinfo_init(threadinfo_t *tinfo, const config_t *config,
+                const times_t *times)
+{
+    unsigned int offset, socket_offset, i;
+
+    memset(tinfo, 0, sizeof(*tinfo));
+    MUTEX_INIT(&tinfo->lock);
+    COND_INIT(&tinfo->cond);
+
+    ISC_LIST_INIT(tinfo->outstanding_queries);
+    ISC_LIST_INIT(tinfo->unused_queries);
+    for (i = 0; i < NQIDS; i++) {
+        ISC_LINK_INIT(&tinfo->queries[i], link);
+        ISC_LIST_APPEND(tinfo->unused_queries, &tinfo->queries[i], link);
+        tinfo->queries[i].list = &tinfo->unused_queries;
+    }
+
+    offset = tinfo - threads;
+
+    tinfo->dnsctx = perf_dns_createctx(config->updates);
+
+    tinfo->config = config;
+    tinfo->times = times;
+
+    /*
+     * Compute per-thread limits based on global values.
+     */
+    tinfo->max_outstanding = per_thread(config->max_outstanding,
+                                        config->threads, offset);
+    tinfo->max_qps = per_thread(config->max_qps, config->threads, offset);
+    tinfo->nsocks = per_thread(config->clients, config->threads, offset);
+
+    /*
+     * We can't have more than 64k outstanding queries per thread.
+     */
+    if (tinfo->max_outstanding > NQIDS)
+        tinfo->max_outstanding = NQIDS;
+
+    if (tinfo->nsocks > MAX_SOCKETS)
+        tinfo->nsocks = MAX_SOCKETS;
+
+    tinfo->socks = isc_mem_get(mctx, tinfo->nsocks * sizeof(int));
+    if (tinfo->socks == NULL)
+        perf_log_fatal("out of memory");
+    socket_offset = 0;
+    for (i = 0; i < offset; i++)
+        socket_offset += threads[i].nsocks;
+    for (i = 0; i < tinfo->nsocks; i++)
+        tinfo->socks[i] = perf_net_opensocket(&config->server_addr,
+                                              &config->local_addr,
+                                              socket_offset++,
+                                              config->bufsize);
+    tinfo->current_sock = 0;
+
+    THREAD(&tinfo->receiver, do_recv, tinfo);
+    THREAD(&tinfo->sender, do_send, tinfo);
+}
+
+static void
+threadinfo_stop(threadinfo_t *tinfo)
+{
+    SIGNAL(&tinfo->cond);
+    JOIN(tinfo->sender, NULL);
+    JOIN(tinfo->receiver, NULL);
+}
+
+static void
+threadinfo_cleanup(threadinfo_t *tinfo, times_t *times)
+{
+    unsigned int i;
+
+    if (interrupted)
+        cancel_queries(tinfo);
+    for (i = 0; i < tinfo->nsocks; i++)
+        close(tinfo->socks[i]);
+    isc_mem_put(mctx, tinfo->socks, tinfo->nsocks * sizeof(int));
+    perf_dns_destroyctx(&tinfo->dnsctx);
+    if (tinfo->last_recv > times->end_time)
+        times->end_time = tinfo->last_recv;
+}
+
+int
+main(int argc, char **argv)
+{
+    config_t config;
+    times_t times;
+    stats_t total_stats;
+    threadinfo_t stats_thread;
+    unsigned int i;
+    isc_result_t result;
+
+    printf("DNS Performance Testing Tool\n"
+           "Nominum Version " VERSION "\n\n");
+
+    setup(argc, argv, &config);
+
+    if (pipe(threadpipe) < 0 || pipe(mainpipe) < 0 || pipe(intrpipe) < 0)
+        perf_log_fatal("creating pipe");
+
+    perf_datafile_setpipefd(input, threadpipe[0]);
+
+    perf_os_blocksignal(SIGINT, ISC_TRUE);
+
+    print_initial_status(&config);
+
+    threads = isc_mem_get(mctx, config.threads * sizeof(threadinfo_t));
+    if (threads == NULL)
+        perf_log_fatal("out of memory");
+    for (i = 0; i < config.threads; i++)
+        threadinfo_init(&threads[i], &config, &times);
+    if (config.stats_interval > 0) {
+        stats_thread.config = &config;
+        stats_thread.times = &times;
+        THREAD(&stats_thread.sender, do_interval_stats, &stats_thread);
+    }
+
+    times.start_time = get_time();
+    if (config.timelimit > 0)
+        times.stop_time = times.start_time + config.timelimit;
+    else
+        times.stop_time = ISC_UINT64_MAX;
+    times.stop_time_ns.tv_sec = times.stop_time / MILLION;
+    times.stop_time_ns.tv_nsec = (times.stop_time % MILLION) * 1000;
+
+    LOCK(&start_lock);
+    started = ISC_TRUE;
+    BROADCAST(&start_cond);
+    UNLOCK(&start_lock);
+
+    perf_os_handlesignal(SIGINT, handle_sigint);
+    perf_os_blocksignal(SIGINT, ISC_FALSE);
+    result = perf_os_waituntilreadable(mainpipe[0], intrpipe[0],
+                                       times.stop_time - times.start_time);
+    if (result == ISC_R_CANCELED)
+        interrupted = ISC_TRUE;
+
+    times.end_time = get_time();
+
+    write(threadpipe[1], "", 1);
+    for (i = 0; i < config.threads; i++)
+        threadinfo_stop(&threads[i]);
+    if (config.stats_interval > 0)
+        JOIN(stats_thread.sender, NULL);
+
+    for (i = 0; i < config.threads; i++)
+        threadinfo_cleanup(&threads[i], &times);
+
+    print_final_status(&config);
+
+    sum_stats(&config, &total_stats);
+    print_statistics(&config, &times, &total_stats);
+
+    isc_mem_put(mctx, threads, config.threads * sizeof(threadinfo_t));
+    cleanup(&config);
+
+    return (0);
 }

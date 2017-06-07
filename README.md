@@ -1,69 +1,37 @@
-dnsperf
-======
-A DNS performance tool.
+# dnsperf
 
-### Introduction
-Dnsperf is a single-process dns load testing and benchmarking utility. It was designed to measure the performance of your
-DNS Server or Local DNS Server by send a configured number of queries.
-Performance measures contains elapsed time, its transation rate, its concurrrency and the percentage of successful queries.
-These measures are reported at the end of each testing.
+## Overview
 
-### Usage
-Dnsperf supports the following command line options:
+[https://github.com/nominum/dnsperf](https://github.com/nominum/dnsperf)
 
-**-s**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the DNS server's IP address. The default IP is `127.0.0.1`.  
-**-p**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the DNS server's port. The default Port is `53`.  
-**-d**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the input data file. Input data file contains `query domain` and `query type`.  
-**-t**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the timeout for query completion in millisecond. The default timeout is `3000ms`.  
-**-Q**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the max number of queries to be send. The default number is `1000`.  
-**-c**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the number of concurrent queries. The default number is `100`. Dnsperf will randomly pick a `query domain` from data file as QNAME.  
-**-l**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies how long to run tests in seconds. The default number is infinite.  
-**-e**
-&nbsp;&nbsp;&nbsp;&nbsp;This will sets the real client IP in query string following the rules defined in [edns-client-subnet].  
+This is a collection of DNS server performance testing tools, including dnsperf
+and resperf.  For more information, see the dnsperf(1) and resperf(1) man pages.
 
-**-i**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies interval of queries in seconds. The default number is zero. This option is not supported currently.  
-**-P**
-&nbsp;&nbsp;&nbsp;&nbsp;Specifies the transport layer protocol to send DNS queries, `udp` or `tcp`. As we know, although UDP is the suggested protocol, DNS queries can be send either by UDP or TCP. The default is `udp`. `tcp` is not supported currently, and it is coming soon.  
-**-f**
-&nbsp;&nbsp;&nbsp;&nbsp;Specify address family of DNS transport, `inet` or `inet6`. The default is `inet`. `inet6` is not supported currently.  
-**-v**
-&nbsp;&nbsp;&nbsp;&nbsp;Verbose: report the RCODE of each response on stdout.  
-**-h**
-&nbsp;&nbsp;&nbsp;&nbsp;Print the usage of dnsperf.  
+## Usage
 
-### Data file format
-An example of data file format is shown in file `a.out` in project directory.
-In the file, the line begin with `#` is recgonized as comment. Each useful line contains two columns. The first column is the `domain name` to be queried, and the second column is the `query type`.  
-The `query type` currently supported includes:  `A`,`NS`,`MD`,`MF`,`CNAME`,`SOA`,`MB`,`MG`,`MR`,`NULL`,`WKS`,`PTR`,`HINFO`,`MINFO`,`MX`,`TXT`,`AAAA`,`SRV`,`NAPTR`,`A6`,`ASFR`,`MAILB`,`MAILA`,`ANY`.
+dnsperf and resperf read input files describing DNS queries, and send those
+queries to DNS servers to measure performance.
 
-### Performance Statistics
-Performance statistics will displayed on your `stdin` after testing. The following is a sample outputs.
-```sh
-DNS Performance Testing Tool
+## Installation
 
-[Status] Processing query data
-[Status] Sending queries to 127.0.0.1:53
-time up
-[Status]DNS Query Performance Testing Finish
-[Result]Queries sent:		35650
-[Result]Queries completed:	35578
-[Result]Complete percentage:	99.80%
+To configure, compile, and install these programs, follow these steps.
 
-[Result]Elapsed time(s):	1.00000
+1. Make sure that BIND 9 (9.4.0 or greater) is installed, including libraries
+   and header files, and that the isc-config.sh program distributed with BIND
+   is in your path.
+   
+   Note: many versions of bind do not correctly install the <isc/hmacsha.h>
+   header file, so if the compilation fails, obtain this file from the BIND
+   source distribution, and install it in the appropriate place.
 
-[Result]Queries Per Second:	35650.0000
-```
-The outputs is easy to comprehend.
+2. Run "sh configure" to configure the software.  Most standard configure
+   options are supported.
 
-### Author
-Cobblau, <keycobing@gmail.com>
+3. Run "make" to build dnsperf and resperf
 
-[edns-client-subnet]: http://www.afasterinternet.com/ietfdraft.htm
+4. Run "make install" to install dnsperf and resperf.
+
+## Additional Software
+
+The contrib directory contains additional software related to dnsperf and
+resperf.
