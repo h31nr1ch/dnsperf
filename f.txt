@@ -1,5 +1,0 @@
-www.google.com ANY
-www.tibiabr.com ANY
-www.github.com ANY 
-www.facebook.com ANY
-www.twitter.com A
