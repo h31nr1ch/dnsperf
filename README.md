@@ -65,7 +65,4 @@ time up
 ```
 The outputs is easy to comprehend.
 
-### Author
-Cobblau, <keycobing@gmail.com>
-
 [edns-client-subnet]: http://www.afasterinternet.com/ietfdraft.htm
